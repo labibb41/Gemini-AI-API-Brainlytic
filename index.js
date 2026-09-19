@@ -13,16 +13,24 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const upload = multer(); // in-memory storage (req.file.buffer)
 
-// Inisialisasi Google GenAI SDK
+// Inisialisasi Google GenAI SDK (Klien Utama & Cadangan)
 const apiKey = process.env.GEMINI_API_KEY;
 if (!apiKey) {
     console.warn("PERINGATAN: GEMINI_API_KEY belum disetel di file .env!");
 }
 const ai = new GoogleGenAI({ apiKey });
 
-// Model utama dan fallback
-const PRIMARY_MODEL = process.env.GEMINI_MODEL || "gemini-3.5-flash";
-const FALLBACK_MODEL = "gemini-3.5-flash-lite";
+// Opsional: Kunci API Cadangan jika kuota kunci utama habis
+const backupApiKey = process.env.GEMINI_API_KEY_BACKUP;
+const aiBackup = backupApiKey ? new GoogleGenAI({ apiKey: backupApiKey }) : null;
+
+// Rantai Model Cadangan (Multi-Tier Fallback)
+// Jika model utama sedang antre padat (503 / 429), sistem otomatis mencoba model berikutnya
+const CANDIDATE_MODELS = [
+    process.env.GEMINI_MODEL || "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-flash-latest"
+];
 
 // Karakter & System Instruction Brainlytic
 const SYSTEM_INSTRUCTION = `Kamu adalah "Brainlytic", seorang AI Tutor dan Study Buddy yang cerdas, sabar, empatik, dan analitis.
@@ -117,25 +125,54 @@ app.post('/chat', upload.single('file'), async (req, res) => {
             systemInstruction: SYSTEM_INSTRUCTION
         };
 
-        let response;
-        try {
-            response = await ai.models.generateContent({
-                model: PRIMARY_MODEL,
-                contents,
-                config: generateConfig
-            });
-        } catch (modelErr) {
-            // Jika model utama tidak tersedia atau overload (503/404), gunakan model cadangan
-            console.warn(`Percobaan model ${PRIMARY_MODEL} gagal, beralih ke ${FALLBACK_MODEL}:`, modelErr.message);
-            response = await ai.models.generateContent({
-                model: FALLBACK_MODEL,
-                contents,
-                config: generateConfig
-            });
+        let resultText = null;
+        let lastError = null;
+
+        // 1. Coba berurutan pada daftar model cadangan dengan akun utama
+        for (const modelName of CANDIDATE_MODELS) {
+            try {
+                const response = await ai.models.generateContent({
+                    model: modelName,
+                    contents,
+                    config: generateConfig
+                });
+                if (response && response.text) {
+                    resultText = response.text;
+                    break;
+                }
+            } catch (modelErr) {
+                lastError = modelErr;
+                console.warn(`[Model Fallback] ${modelName} gagal: ${modelErr.message}. Beralih ke model berikutnya...`);
+            }
+        }
+
+        // 2. Jika akun utama gagal/kehabisan kuota dan tersedia API key cadangan
+        if (!resultText && aiBackup) {
+            console.warn("[API Key Fallback] Mengaktifkan akun Google Gemini cadangan...");
+            for (const modelName of CANDIDATE_MODELS) {
+                try {
+                    const response = await aiBackup.models.generateContent({
+                        model: modelName,
+                        contents,
+                        config: generateConfig
+                    });
+                    if (response && response.text) {
+                        resultText = response.text;
+                        break;
+                    }
+                } catch (backupErr) {
+                    lastError = backupErr;
+                }
+            }
+        }
+
+        // Jika semua model dan cadangan tetap gagal
+        if (!resultText) {
+            throw lastError || new Error("Semua model Gemini sedang mengalami antrean penuh. Silakan coba sesaat lagi.");
         }
 
         res.status(200).json({
-            result: response.text
+            result: resultText
         });
 
     } catch (error) {
